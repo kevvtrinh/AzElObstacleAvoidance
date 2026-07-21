@@ -1,0 +1,15 @@
+# MATLAB-generated artifacts
+*.mat
+*.asv
+*.m~
+slprj/
+codegen/
+*.mex*
+
+# Superseded generated animations
+gauntlet_all_runs.gif
+gauntlet_all_runs_fixed.gif
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
