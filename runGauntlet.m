@@ -1,8 +1,9 @@
 function report = runGauntlet
 %RUNGAUNTLET Run every static, unit, scenario, spiral, and seam check.
-%   REPORT = RUNGAUNTLET fails immediately if CHECKCODE reports an issue,
-%   a unit test fails, a scenario misses its metric, an independent path
-%   audit fails, or an azimuth-wraparound check fails.
+%   REPORT = RUNGAUNTLET recursively checks the public facades and +azel
+%   package implementations. It fails immediately if CHECKCODE reports an
+%   issue, a unit test fails, a scenario misses its metric, an independent
+%   path audit fails, or an azimuth-wraparound check fails.
 
     projectFolder = fileparts(mfilename('fullpath'));
     previousFolder = pwd;
@@ -13,12 +14,17 @@ function report = runGauntlet
     set(groot,'DefaultFigureVisible','off');
 
     fprintf('=== Q-learning az/el planner gauntlet ===\n');
-    files = dir(fullfile(projectFolder,'*.m'));
+    % Package implementations are part of the deliverable, so static
+    % analysis must recurse rather than checking only the public facades.
+    files = dir(fullfile(projectFolder,'**','*.m'));
     analysis = cell(numel(files),1);
+    relativeNames = strings(numel(files),1);
     issueCount = 0;
     for fileIndex = 1:numel(files)
-        analysis{fileIndex} = checkcode( ...
-            fullfile(projectFolder,files(fileIndex).name),'-id');
+        fullName = fullfile(files(fileIndex).folder,files(fileIndex).name);
+        relativeNames(fileIndex) = string(erase( ...
+            fullName,[projectFolder,filesep]));
+        analysis{fileIndex} = checkcode(fullName,'-id');
         issueCount = issueCount+numel(analysis{fileIndex});
     end
     if issueCount > 0
@@ -26,7 +32,7 @@ function report = runGauntlet
         for fileIndex = 1:numel(files)
             messages = analysis{fileIndex};
             for messageIndex = 1:numel(messages)
-                fprintf('  %s:%d %s [%s]\n',files(fileIndex).name, ...
+                fprintf('  %s:%d %s [%s]\n',relativeNames(fileIndex), ...
                     messages(messageIndex).line, ...
                     messages(messageIndex).message, ...
                     messages(messageIndex).id);

@@ -12,7 +12,8 @@ deterministic planner gauntlet.
 
 ## Quick start
 
-Put the MATLAB files in one folder and run the example:
+Clone or download the repository, keep its folder structure intact, make the
+repository root the MATLAB current folder, and run:
 
 ```matlab
 runQLearningAzElExample
@@ -367,25 +368,41 @@ Otherwise only the wait action may remain valid.
 - `turnPenalty` discourages direction changes.
 - `goalReward` rewards a valid terminal arrival.
 
+## Code organization
+
+User-facing functions remain at the repository root for backward compatibility.
+Their implementations are grouped in MATLAB namespaces under `+azel`:
+
+| Namespace | Responsibility |
+| --- | --- |
+| `azel.planning` | Planning pipeline, Q-learning, graph fallback, and result assembly |
+| `azel.mapping` | Occupancy-grid construction and clearance inflation |
+| `azel.trajectory` | Fixed-time C2 Bezier command generation and kinematic bounds |
+| `azel.audit` | Independent polyline and analytic-trajectory certification |
+| `azel.geometry` | Seam-aware angles and time-interpolated obstacle geometry |
+| `azel.visualization` | Safe display-path selection, plotting, and animation |
+
+For example, existing code can continue calling `planAzElQLearning(...)`; the
+facade delegates to `azel.planning.planAzElQLearning(...)`. Only the repository
+root belongs on the MATLAB path; do not add `+azel` directories directly.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for module boundaries, data contracts,
+and extension guidance. MATLAB's `help Contents` and `help azel` commands also
+provide a categorized function index.
+
 ## Main files
 
-- `planAzElQLearning.m` - Q-learning, periodic topology, graph fallback,
-  extraction, continuous safety, diagnostics, and smoothing
-- `buildAzElOccupancy.m` - polygon rasterization, clearance inflation, temporal
-  padding, and periodic seam handling
+- `planAzElQLearning.m` - stable public facade for the planning pipeline
+- `buildAzElOccupancy.m`, `smoothAzElTrajectory.m`, and the audit/geometry/
+  visualization entry points - stable compatibility facades
+- `+azel/` - namespaced implementation modules, each with a `Contents.m` index
+- `Contents.m` - categorized public API index
 - `shortestAzimuthDeltaDeg.m`, `interpolateAzimuthDeg.m`, and
-  `unwrapAzimuthDeg.m` - wrapped-angle utilities
+  `unwrapAzimuthDeg.m` - public wrapped-angle facades
 - `createPlannerGauntletSuite.m` - deterministic definitions for all 18 planner
   scenarios
 - `runPlannerGauntletSuite.m` - scenario execution and behavior assertions
-- `auditPlannerPath.m` - independent static, swept-dynamic, and goal-hold path
-  audit and trajectory dispatch
-- `smoothAzElTrajectory.m` - adaptive fixed-time C2 quintic trajectory
-  generation with rate, acceleration, and jerk limits
-- `auditAzElTrajectory.m` - analytic curve, moving-obstacle, continuity, and
-  actuator-limit certification
-- `interpolateAzElObstacleFrame.m` - time-accurate obstacle geometry for
-  animation and GIF frames
+- `ARCHITECTURE.md` - dependency rules, struct contracts, and maintenance guide
 - `createSpiralGauntletScenario.m` - 5.25-cycle spiral-to-center challenge
 - `runAzimuthWraparoundGauntlet.m` - seven named seam and wrapped-angle checks
 - `runGauntlet.m` - complete static-analysis, unit-test, scenario, seam,

@@ -1,7 +1,7 @@
 function azimuth_deg = interpolateAzimuthDeg(from_deg,to_deg,fraction)
-%INTERPOLATEAZIMUTHDEG Interpolate along the shortest wrapped angular arc.
+%INTERPOLATEAZIMUTHDEG Public facade for shortest-arc interpolation.
+%   The implementation lives in AZEL.GEOMETRY.INTERPOLATEAZIMUTHDEG.
 
-    validateattributes(fraction,{'numeric'},{'real','finite'});
-    azimuth_deg = from_deg+fraction.* ...
-        shortestAzimuthDeltaDeg(from_deg,to_deg);
+    azimuth_deg = azel.geometry.interpolateAzimuthDeg( ...
+        from_deg,to_deg,fraction);
 end
