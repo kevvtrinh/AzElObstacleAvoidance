@@ -4,6 +4,9 @@ function result = planAzElQLearning(azElData,startAzEl_deg,goalAzEl_deg,options)
 %   states (azimuth cell, elevation cell, time index). The nine actions are
 %   wait plus the eight neighboring grid moves. Unsafe actions are masked
 %   before selection, so exploration never deliberately enters a mask.
+%   The selected timed polyline is postprocessed into RESULT.trajectory, a
+%   collision-certified C2 quintic command with explicit per-axis rate,
+%   acceleration, and jerk limits.
 %
 %   Independent learners can train in PARFOR. Each Q-table stays on its
 %   worker; only the compact candidate path returns to the client.
@@ -49,7 +52,14 @@ function result = planAzElQLearning(azElData,startAzEl_deg,goalAzEl_deg,options)
         'maxQTableMB',512, ...
         'smoothPath',true, ...
         'smoothingMaxLookahead',250, ...
+        'generateSmoothTrajectory',true, ...
+        'trajectoryRequireEndpointRest',false, ...
+        'trajectorySampleTime_s',0.1, ...
+        'trajectoryMaxBlendFraction',0.48, ...
+        'trajectoryMinBlendFraction',0.02, ...
+        'trajectoryBlendAttempts',13, ...
         'verbose',true));
+    options = applyTrajectoryDefaults(options);
 
     options.azimuthTopology = string(validatestring( ...
         options.azimuthTopology,{'mechanical','periodic'},mfilename, ...
@@ -176,42 +186,126 @@ function result = planAzElQLearning(azElData,startAzEl_deg,goalAzEl_deg,options)
             holdSteps,actionModel,options,episodesPerLearner,1);
     end
 
-    % Keep deterministic time-expanded graph search only as a failure
-    % fallback. It prevents a low episode count or a local guidance minimum
-    % from returning no path, while a successful learned policy is always
-    % preferred.
+    % Keep deterministic time-expanded graph search as the route fallback.
+    % When a smooth executable command is requested, it is also tried after
+    % all successful learned routes fail trajectory generation or audit.
     if ~any(cellfun(@(candidate) candidate.success,candidates))
-        fallback = extractGraphFallback(blockedByCell,grid,startCell, ...
+        fallback = makeGraphFallbackCandidate(blockedByCell,grid,startCell, ...
             goalCells,goalDistance_deg,holdSteps,actionModel,options);
-        fallback.learnerIndex = 0;
-        fallback.episodesCompleted = 0;
-        fallback.successfulEpisodes = 0;
-        fallback.trainingStopReason = "notRun";
         candidates{end+1,1} = fallback;
     end
 
-    bestCandidateIndex = selectBestCandidate(candidates);
+    candidateTrajectories = cell(size(candidates));
+    candidateTrajectoryAudits = cell(size(candidates));
+    executableCandidateIndex = NaN;
+    trajectoryAttempts = 0;
+    if options.generateSmoothTrajectory
+        successfulOrder = rankSuccessfulCandidates(candidates);
+        for orderIndex = 1:numel(successfulOrder)
+            candidateIndex = successfulOrder(orderIndex);
+            trajectoryAttempts = trajectoryAttempts+1;
+            [candidateTrajectories{candidateIndex}, ...
+                candidateTrajectoryAudits{candidateIndex},passed] = ...
+                makeAuditedTrajectory(candidates{candidateIndex}, ...
+                planningData,grid,options);
+            if passed
+                executableCandidateIndex = candidateIndex;
+                break
+            end
+        end
+
+        % A learned route can reach the goal yet be impossible to round at
+        % its fixed obstacle timing. In that case the deterministic search
+        % may supply a different route that admits a certified trajectory.
+        if isnan(executableCandidateIndex) && ...
+                ~hasGraphFallbackCandidate(candidates)
+            fallback = makeGraphFallbackCandidate( ...
+                blockedByCell,grid,startCell,goalCells,goalDistance_deg, ...
+                holdSteps,actionModel,options);
+            candidates{end+1,1} = fallback;
+            candidateTrajectories{end+1,1} = [];
+            candidateTrajectoryAudits{end+1,1} = [];
+            if fallback.success
+                candidateIndex = numel(candidates);
+                trajectoryAttempts = trajectoryAttempts+1;
+                [candidateTrajectories{candidateIndex}, ...
+                    candidateTrajectoryAudits{candidateIndex},passed] = ...
+                    makeAuditedTrajectory(fallback,planningData,grid,options);
+                if passed
+                    executableCandidateIndex = candidateIndex;
+                end
+            end
+        end
+    end
+
+    if ~isnan(executableCandidateIndex)
+        bestCandidateIndex = executableCandidateIndex;
+    else
+        bestCandidateIndex = selectBestCandidate(candidates);
+    end
     best = candidates{bestCandidateIndex};
     result = struct;
-    result.success = best.success;
-    if best.success
+    routeReachedGoal = logical(best.success);
+    result.trajectory = emptyTrajectoryResult( ...
+        "smooth trajectory generation was not requested");
+    trajectoryAudit = unsuccessfulTrajectoryAudit( ...
+        "smooth trajectory generation was not requested");
+    if options.generateSmoothTrajectory
+        if bestCandidateIndex <= numel(candidateTrajectories) && ...
+                ~isempty(candidateTrajectories{bestCandidateIndex})
+            result.trajectory = candidateTrajectories{bestCandidateIndex};
+            trajectoryAudit = ...
+                candidateTrajectoryAudits{bestCandidateIndex};
+        elseif routeReachedGoal
+            result.trajectory = emptyTrajectoryResult( ...
+                "no audited smooth trajectory was found for the route");
+            trajectoryAudit = unsuccessfulTrajectoryAudit( ...
+                "no audited smooth trajectory was found for the route");
+        else
+            result.trajectory = emptyTrajectoryResult( ...
+                "no route reached the goal");
+            trajectoryAudit = unsuccessfulTrajectoryAudit( ...
+                "no route reached the goal");
+        end
+        result.success = routeReachedGoal && trajectoryAudit.success;
+    else
+        result.success = routeReachedGoal;
+    end
+
+    if result.success
         result.status = "SUCCESS";
         if best.learnerIndex == 0
-            result.message = ['The safe graph-search fallback reached the goal; ' ...
-                'increase episodes if a learned policy is required.'];
+            if options.generateSmoothTrajectory
+                result.message = ['The graph-search fallback reached the goal ' ...
+                    'with an audited smooth executable trajectory.'];
+            else
+                result.message = ['The safe graph-search fallback reached the goal; ' ...
+                    'increase episodes if a learned policy is required.'];
+            end
+        elseif options.generateSmoothTrajectory
+            result.message = ['A learned route reached the goal with an audited ' ...
+                'smooth executable trajectory.'];
         else
             result.message = 'A collision-free Q-learning policy reached the goal.';
         end
+    elseif routeReachedGoal && options.generateSmoothTrajectory
+        result.status = "FAILED";
+        result.message = ['A collision-free route reached the goal, but no ' ...
+            'requested smooth trajectory passed the execution audit: ' ...
+            char(string(trajectoryAudit.message))];
     else
         result.status = "FAILED";
         result.message = 'No trained policy reached the goal within the time horizon.';
     end
     result.path = best.path;
+    result.routeSuccess = routeReachedGoal;
+    result.routeReachedGoal = routeReachedGoal;
     result.grid = grid;
     result.options = options;
     result.requestedStartAzEl_deg = startAzEl_deg;
     result.requestedGoalAzEl_deg = goalAzEl_deg;
     result.goalCells = goalCells;
+    result.trajectoryAudit = trajectoryAudit;
     result.diagnostic = struct;
     result.diagnostic.planningTime_s = toc(plannerTic);
     result.diagnostic.requestedParallel = logical(options.useParallel);
@@ -242,6 +336,9 @@ function result = planAzElQLearning(azElData,startAzEl_deg,goalAzEl_deg,options)
         result.diagnostic.selectedPolicySource = "graphFallback";
     end
     result.diagnostic.selectedPathLength_deg = best.pathLength_deg;
+    result.diagnostic.routeSuccess = routeReachedGoal;
+    result.diagnostic.routeReachedGoal = routeReachedGoal;
+    result.diagnostic.executionSuccess = logical(result.success);
     result.diagnostic.qTableMBPerLearner = qTableMB;
     result.diagnostic.maskOccupiedFraction = maskStats.occupiedFraction;
     result.diagnostic.arrivalTime_s = best.path.time_s(end);
@@ -250,8 +347,25 @@ function result = planAzElQLearning(azElData,startAzEl_deg,goalAzEl_deg,options)
     result.diagnostic.turnCountBeforeSmoothing = best.turnCountBeforeSmoothing;
     result.diagnostic.turnCountAfterSmoothing = best.turnCountAfterSmoothing;
     result.diagnostic.finalGoalDistance_deg = best.finalGoalDistance_deg;
-    result.diagnostic.collisionFree = validatePath( ...
+    routeCollisionFree = validatePath( ...
         best.path,blockedByCell,grid,options,actionModel.dynamicPolygons);
+    result.diagnostic.routeCollisionFree = routeCollisionFree;
+    if options.generateSmoothTrajectory
+        result.diagnostic.collisionFree = routeCollisionFree && ...
+            trajectoryAudit.success;
+    else
+        result.diagnostic.collisionFree = routeCollisionFree;
+    end
+    result.diagnostic.trajectoryAttempts = trajectoryAttempts;
+    result.diagnostic.trajectoryAuditSuccessful = trajectoryAudit.success;
+    result.diagnostic.trajectoryGenerated = ...
+        result.trajectory.success && trajectoryAudit.success;
+    result.diagnostic.trajectoryCollisionFree = ...
+        trajectoryAudit.collisionFree;
+    result.diagnostic.trajectoryKinematicallyFeasible = ...
+        trajectoryAudit.kinematicallyFeasible;
+    result.diagnostic.trajectoryC2Continuous = trajectoryAudit.c2Continuous;
+    result.diagnostic.trajectoryMessage = string(trajectoryAudit.message);
     result.diagnostic.lastFeasible_time_s = best.path.time_s(end);
     result.diagnostic.lastFeasible_azEl_deg = ...
         [best.path.az_deg(end),best.path.el_deg(end)];
@@ -269,6 +383,21 @@ function options = applyDefaults(options,defaults)
 end
 
 
+function options = applyTrajectoryDefaults(options)
+    dependentDefaults = { ...
+        'maxAzAcceleration_deg_s2',4*options.azRate_deg_s; ...
+        'maxElAcceleration_deg_s2',4*options.elRate_deg_s; ...
+        'maxAzJerk_deg_s3',20*options.azRate_deg_s; ...
+        'maxElJerk_deg_s3',20*options.elRate_deg_s};
+    for row = 1:size(dependentDefaults,1)
+        name = dependentDefaults{row,1};
+        if ~isfield(options,name) || isempty(options.(name))
+            options.(name) = dependentDefaults{row,2};
+        end
+    end
+end
+
+
 function validatePlannerOptions(options)
     validateattributes(options.azLim_deg,{'numeric'}, ...
         {'row','numel',2,'increasing','finite'},mfilename,'options.azLim_deg');
@@ -281,7 +410,11 @@ function validatePlannerOptions(options)
             'options.gridStep_deg must be a scalar or a two-element row vector.');
     end
 
-    positiveScalars = {'azRate_deg_s','elRate_deg_s','maxQTableMB'};
+    positiveScalars = {'azRate_deg_s','elRate_deg_s','maxQTableMB', ...
+        'trajectorySampleTime_s','maxAzAcceleration_deg_s2', ...
+        'maxElAcceleration_deg_s2','maxAzJerk_deg_s3', ...
+        'maxElJerk_deg_s3','trajectoryMaxBlendFraction', ...
+        'trajectoryMinBlendFraction'};
     for k = 1:numel(positiveScalars)
         name = positiveScalars{k};
         validateattributes(options.(name),{'numeric'}, ...
@@ -306,7 +439,8 @@ function validatePlannerOptions(options)
         'guidedExplorationProbability',true);
 
     positiveIntegers = {'episodes','minimumEpisodesPerLearner', ...
-        'earlyStopSuccessStreak','smoothingMaxLookahead'};
+        'earlyStopSuccessStreak','smoothingMaxLookahead', ...
+        'trajectoryBlendAttempts'};
     for k = 1:numel(positiveIntegers)
         name = positiveIntegers{k};
         validateattributes(options.(name),{'numeric'}, ...
@@ -364,9 +498,17 @@ function validatePlannerOptions(options)
     end
 
     logicalOptions = {'preventCornerCutting','goalAzimuthIsWrapped', ...
-        'useParallel','smoothPath','verbose'};
+        'useParallel','smoothPath','generateSmoothTrajectory', ...
+        'trajectoryRequireEndpointRest','verbose'};
     for k = 1:numel(logicalOptions)
         validateLogicalScalar(options.(logicalOptions{k}),logicalOptions{k});
+    end
+    if options.trajectoryMinBlendFraction > ...
+            options.trajectoryMaxBlendFraction || ...
+            options.trajectoryMaxBlendFraction >= 0.5
+        error('planAzElQLearning:InvalidTrajectoryBlendRange', ...
+            ['Trajectory blend fractions must satisfy 0 < minimum <= ' ...
+            'maximum < 0.5.']);
     end
 end
 
@@ -1471,6 +1613,19 @@ end
 
 
 function bestIndex = selectBestCandidate(candidates)
+    order = rankCandidates(candidates);
+    bestIndex = order(1);
+end
+
+
+function order = rankSuccessfulCandidates(candidates)
+    order = rankCandidates(candidates);
+    successful = cellfun(@(candidate) candidate.success,candidates);
+    order = order(successful(order));
+end
+
+
+function order = rankCandidates(candidates)
     numCandidates = numel(candidates);
     metrics = zeros(numCandidates,4);
     for k = 1:numCandidates
@@ -1484,7 +1639,159 @@ function bestIndex = selectBestCandidate(candidates)
         end
     end
     [~,order] = sortrows(metrics,[1,2,3,4]);
-    bestIndex = order(1);
+end
+
+
+function present = hasGraphFallbackCandidate(candidates)
+    present = any(cellfun(@(candidate) ...
+        isfield(candidate,'learnerIndex') && candidate.learnerIndex == 0, ...
+        candidates));
+end
+
+
+function candidate = makeGraphFallbackCandidate( ...
+        blockedByCell,grid,startCell,goalCells,goalDistance_deg, ...
+        holdSteps,actionModel,options)
+    candidate = extractGraphFallback(blockedByCell,grid,startCell, ...
+        goalCells,goalDistance_deg,holdSteps,actionModel,options);
+    candidate.learnerIndex = 0;
+    candidate.episodesCompleted = 0;
+    candidate.successfulEpisodes = 0;
+    candidate.trainingStopReason = "notRun";
+end
+
+
+function [trajectory,audit,passed] = makeAuditedTrajectory( ...
+        candidate,planningData,grid,options)
+    if numel(candidate.path.time_s) < 2
+        trajectory = pointTrajectoryResult(candidate.path,grid,options);
+        audit = auditPointTrajectory(candidate.path,planningData,options);
+        passed = trajectory.success && audit.success;
+        if ~passed
+            trajectory.success = false;
+            trajectory.message = string(audit.message);
+        end
+        return
+    end
+
+    [trajectory,trajectoryInfo] = smoothAzElTrajectory( ...
+        candidate.path,planningData,options);
+    if ~trajectory.success || isempty(trajectory.segments)
+        audit = unsuccessfulTrajectoryAudit(trajectoryInfo.message);
+        trajectory.success = false;
+        passed = false;
+        return
+    end
+
+    trajectoryScenario = struct('data',planningData,'options',options);
+    audit = auditAzElTrajectory(trajectoryScenario,trajectory,true);
+    audit = normalizeTrajectoryAudit(audit);
+    passed = trajectory.success && audit.success;
+    if ~passed
+        trajectory.success = false;
+        trajectory.message = string(audit.message);
+    end
+end
+
+
+function audit = auditPointTrajectory(path,planningData,options)
+    routeResult = struct('success',true,'path',path);
+    pathAudit = auditPlannerPath( ...
+        struct('data',planningData,'options',options),routeResult);
+    mechanicalBoundsSafe = pointInsidePlannerLimits( ...
+        [path.az_deg(1),path.el_deg(1)],options);
+    collisionFree = isfield(pathAudit,'collisionFree') && ...
+        pathAudit.collisionFree;
+    holdSafe = isfield(pathAudit,'holdSafe') && pathAudit.holdSafe;
+    audit = struct( ...
+        'success',collisionFree && holdSafe && mechanicalBoundsSafe, ...
+        'collisionFree',collisionFree,'holdSafe',holdSafe, ...
+        'kinematicallyFeasible',true, ...
+        'mechanicalBoundsSafe',mechanicalBoundsSafe, ...
+        'c2Continuous',true,'message',string(pathAudit.message));
+    if ~mechanicalBoundsSafe
+        audit.message = "stationary trajectory lies outside the mechanical limits";
+    end
+end
+
+
+function inside = pointInsidePlannerLimits(point_deg,options)
+    tolerance = 1e-10;
+    periodic = strcmpi(string(options.azimuthTopology),"periodic");
+    azimuthInside = periodic || (point_deg(1) >= options.azLim_deg(1)-tolerance && ...
+        point_deg(1) <= options.azLim_deg(2)+tolerance);
+    elevationInside = point_deg(2) >= options.elLim_deg(1)-tolerance && ...
+        point_deg(2) <= options.elLim_deg(2)+tolerance;
+    inside = azimuthInside && elevationInside;
+end
+
+
+function audit = normalizeTrajectoryAudit(audit)
+    defaults = unsuccessfulTrajectoryAudit("trajectory audit failed");
+    names = fieldnames(defaults);
+    for fieldIndex = 1:numel(names)
+        name = names{fieldIndex};
+        if ~isfield(audit,name)
+            audit.(name) = defaults.(name);
+        end
+    end
+    audit.success = logical(audit.collisionFree && audit.holdSafe && ...
+        audit.kinematicallyFeasible && audit.mechanicalBoundsSafe && ...
+        audit.c2Continuous);
+end
+
+
+function audit = unsuccessfulTrajectoryAudit(message)
+    audit = struct('success',false,'collisionFree',false, ...
+        'holdSafe',false,'kinematicallyFeasible',false, ...
+        'mechanicalBoundsSafe',false,'c2Continuous',false, ...
+        'message',string(message));
+end
+
+
+function trajectory = emptyTrajectoryResult(message)
+    trajectory = struct( ...
+        'success',false,'message',string(message), ...
+        'time_s',zeros(0,1),'az_deg',zeros(0,1), ...
+        'azWrapped_deg',zeros(0,1),'el_deg',zeros(0,1), ...
+        'timeIndex',zeros(0,1),'planningTimeIndex',zeros(0,1), ...
+        'isWaiting',false(0,1),'azRate_deg_s',zeros(0,1), ...
+        'elRate_deg_s',zeros(0,1), ...
+        'azAcceleration_deg_s2',zeros(0,1), ...
+        'elAcceleration_deg_s2',zeros(0,1), ...
+        'azJerk_deg_s3',zeros(0,1),'elJerk_deg_s3',zeros(0,1), ...
+        'segments',struct('startTime_s',{},'endTime_s',{}, ...
+        'controlPoints_deg',{},'kind',{}), ...
+        'c2Continuous',false,'numFillets',0,'maxHeadingJump_deg',NaN);
+end
+
+
+function trajectory = pointTrajectoryResult(path,grid,options)
+    trajectory = emptyTrajectoryResult( ...
+        "stationary point requires no slew trajectory");
+    trajectory.success = true;
+    trajectory.time_s = path.time_s(:);
+    trajectory.az_deg = path.az_deg(:);
+    trajectory.el_deg = path.el_deg(:);
+    if isfield(path,'azWrapped_deg')
+        trajectory.azWrapped_deg = path.azWrapped_deg(:);
+    elseif strcmpi(string(options.azimuthTopology),"periodic")
+        trajectory.azWrapped_deg = mod(path.az_deg-grid.azLim_deg(1),360)+ ...
+            grid.azLim_deg(1);
+    else
+        trajectory.azWrapped_deg = path.az_deg(:);
+    end
+    trajectory.timeIndex = path.timeIndex(:);
+    trajectory.planningTimeIndex = path.planningTimeIndex(:);
+    trajectory.isWaiting = true(size(path.time_s(:)));
+    trajectory.azRate_deg_s = zeros(size(path.time_s(:)));
+    trajectory.elRate_deg_s = zeros(size(path.time_s(:)));
+    trajectory.azAcceleration_deg_s2 = zeros(size(path.time_s(:)));
+    trajectory.elAcceleration_deg_s2 = zeros(size(path.time_s(:)));
+    trajectory.azJerk_deg_s3 = zeros(size(path.time_s(:)));
+    trajectory.elJerk_deg_s3 = zeros(size(path.time_s(:)));
+    trajectory.c2Continuous = true;
+    trajectory.maxHeadingJump_deg = 0;
 end
 
 
@@ -1492,10 +1799,14 @@ function result = failedStartResult(options,grid,maskStats,startAzEl_deg, ...
         goalAzEl_deg,message)
     result = struct;
     result.success = false;
+    result.routeSuccess = false;
+    result.routeReachedGoal = false;
     result.status = "FAILED";
     result.message = message;
     result.path = struct('planningTimeIndex',[],'timeIndex',[], ...
         'time_s',[],'az_deg',[],'el_deg',[],'isWaiting',[]);
+    result.trajectory = emptyTrajectoryResult(message);
+    result.trajectoryAudit = unsuccessfulTrajectoryAudit(message);
     result.grid = grid;
     result.options = options;
     result.requestedStartAzEl_deg = startAzEl_deg;
@@ -1510,11 +1821,18 @@ function result = failedStartResult(options,grid,maskStats,startAzEl_deg, ...
         'successfulTrainingEpisodes',0,'trainingSuccessRate',0, ...
         'trainingStopReasons',strings(0,1),'earlyStopped',false, ...
         'selectedPolicySource',"none",'selectedPathLength_deg',NaN, ...
+        'routeSuccess',false,'routeReachedGoal',false, ...
+        'executionSuccess',false,'routeCollisionFree',false, ...
         'qTableMBPerLearner',NaN, ...
         'maskOccupiedFraction',maskStats.occupiedFraction, ...
         'arrivalTime_s',NaN,'duration_s',NaN,'waitTime_s',NaN, ...
         'turnCountBeforeSmoothing',NaN,'turnCountAfterSmoothing',NaN, ...
         'finalGoalDistance_deg',NaN,'collisionFree',false, ...
+        'trajectoryGenerated',false,'trajectoryCollisionFree',false, ...
+        'trajectoryKinematicallyFeasible',false, ...
+        'trajectoryC2Continuous',false, ...
+        'trajectoryAttempts',0,'trajectoryAuditSuccessful',false, ...
+        'trajectoryMessage',string(message), ...
         'lastFeasible_time_s',NaN, ...
         'lastFeasible_azEl_deg',[NaN,NaN]);
 end
@@ -1556,6 +1874,17 @@ function printDiagnostic(result)
     fprintf('  Path turns: %d before smoothing, %d after\n', ...
         result.diagnostic.turnCountBeforeSmoothing, ...
         result.diagnostic.turnCountAfterSmoothing);
+    if result.options.generateSmoothTrajectory
+        fprintf('  Smooth command: generated %d, C2 %d, safe %d, feasible %d\n', ...
+            result.diagnostic.trajectoryGenerated, ...
+            result.diagnostic.trajectoryC2Continuous, ...
+            result.diagnostic.trajectoryCollisionFree, ...
+            result.diagnostic.trajectoryKinematicallyFeasible);
+        if ~result.diagnostic.trajectoryGenerated
+            fprintf('  Smooth-command diagnostic: %s\n', ...
+                result.diagnostic.trajectoryMessage);
+        end
+    end
     fprintf('  Planning and training time: %.6g s\n', ...
         result.diagnostic.planningTime_s);
 end

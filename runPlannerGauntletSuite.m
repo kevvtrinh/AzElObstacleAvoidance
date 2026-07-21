@@ -49,8 +49,13 @@ end
 
 function [passed,reason] = evaluateScenario(scenario,result,audit)
     if ~scenario.expectedSuccess
-        passed = ~result.success && audit.collisionFree;
-        if result.success
+        routeReachedGoal = isfield(result,'diagnostic') && ...
+            isfield(result.diagnostic,'routeReachedGoal') && ...
+            result.diagnostic.routeReachedGoal;
+        passed = ~routeReachedGoal && ~result.success && audit.collisionFree;
+        if routeReachedGoal
+            reason = "a raw route reached a supposedly impossible goal";
+        elseif result.success
             reason = "incorrectly reported a route";
         elseif ~audit.collisionFree
             reason = "unsafe partial path: " + audit.message;
@@ -74,6 +79,20 @@ function [passed,reason] = evaluateScenario(scenario,result,audit)
         passed = false;
         reason = "planner collision diagnostic failed";
         return
+    end
+    if isfield(result.options,'generateSmoothTrajectory') && ...
+            result.options.generateSmoothTrajectory
+        if ~isfield(result,'trajectory') || ~result.trajectory.success
+            passed = false;
+            reason = "no dynamically feasible smooth trajectory";
+            return
+        end
+        if ~isfield(audit,'kinematicallyFeasible') || ...
+                ~audit.kinematicallyFeasible || ~audit.c2Continuous
+            passed = false;
+            reason = "smooth trajectory failed its kinematic audit";
+            return
+        end
     end
     dt_s = result.grid.dt_s;
     rateSafe = all(abs(diff(result.path.az_deg)) <= ...

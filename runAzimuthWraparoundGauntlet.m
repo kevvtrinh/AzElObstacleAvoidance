@@ -256,6 +256,9 @@ function options = periodicPlannerOptions
     options.useParallel = false;
     options.randomSeed = 73;
     options.smoothPath = false;
+    % These seam tests intentionally exercise a one-degree-per-second
+    % constant-rate command with no time available for endpoint ramps.
+    options.trajectoryRequireEndpointRest = false;
     options.verbose = false;
 end
 

@@ -14,6 +14,7 @@ function gifFile = createGauntletSuiteGif(gifFile,report)
         report = runGauntlet;
     end
     requireReportFields(report);
+    requireSuccessfulReport(report);
     gifFile = char(gifFile);
 
     canvasPixels = [720,1200];
@@ -31,7 +32,7 @@ function gifFile = createGauntletSuiteGif(gifFile,report)
         report.scenarioSuite.numScenarios), ...
         sprintf('%.2f-turn spiral to the center', ...
         report.spiralScenario.spiralCycles), ...
-        sprintf('%d azimuth seam and wraparound checks', ...
+        sprintf('%d seam checks; analytic C2 command motion', ...
         report.wraparound.numTests)},'ALL RUNS IN ONE FIXED CANVAS');
     [isFirstFrame,frameCount] = appendFrame(figureHandle,gifFile, ...
         isFirstFrame,1.8,canvasPixels,frameCount);
@@ -44,8 +45,9 @@ function gifFile = createGauntletSuiteGif(gifFile,report)
             isFirstFrame,0.75,canvasPixels,frameCount);
 
         result = entry.result;
-        if ~isempty(result.path.time_s)
-            pathIndices = sampleIndices(numel(result.path.time_s),8);
+        displayPath = selectAzElDisplayPath(result);
+        if ~isempty(displayPath.time_s)
+            pathIndices = sampleIndices(numel(displayPath.time_s),12);
             for frameIndex = 1:numel(pathIndices)
                 pathIndex = pathIndices(frameIndex);
                 isFinal = frameIndex == numel(pathIndices);
@@ -87,7 +89,8 @@ function gifFile = createGauntletSuiteGif(gifFile,report)
     [isFirstFrame,frameCount] = appendFrame(figureHandle,gifFile, ...
         isFirstFrame,1.0,canvasPixels,frameCount);
 
-    spiralIndices = sampleIndices(numel(report.spiralResult.path.time_s),24);
+    spiralPath = selectAzElDisplayPath(report.spiralResult);
+    spiralIndices = sampleIndices(numel(spiralPath.time_s),36);
     for frameIndex = 1:numel(spiralIndices)
         pathIndex = spiralIndices(frameIndex);
         isFinal = frameIndex == numel(spiralIndices);
@@ -148,6 +151,23 @@ function requireReportFields(report)
 end
 
 
+function requireSuccessfulReport(report)
+    scenariosPassed = isfield(report.scenarioSuite,'passed') && ...
+        report.scenarioSuite.passed && ...
+        all([report.scenarioSuite.entries.passed]);
+    wrapPassed = isfield(report.wraparound,'passed') && ...
+        report.wraparound.passed && all([report.wraparound.entries.passed]);
+    spiralPassed = report.spiralResult.success && ...
+        report.spiralAudit.collisionFree;
+    countsAgree = report.numNamedChecksPassed == report.numNamedChecks;
+    if ~isfield(report,'passed') || ~report.passed || ...
+            ~scenariosPassed || ~wrapPassed || ~spiralPassed || ~countsAgree
+        error('createGauntletSuiteGif:GauntletFailed', ...
+            'The GIF can only claim completion for a fully passing report.');
+    end
+end
+
+
 function showScenarioTitle(figureHandle,entry,index,total)
     auditText = auditSummary(entry);
     showTitleCard(figureHandle,char(entry.name), ...
@@ -162,12 +182,12 @@ function drawScenarioFrame(figureHandle,entry,index,total,pathIndex, ...
         sprintf('SCENARIO %02d / %02d',index,total));
     scenario = entry.scenario;
     result = entry.result;
+    path = selectAzElDisplayPath(result);
 
     if pathIndex > 0
-        dataIndex = pathDataIndex(result.path,pathIndex);
-        currentAzEl_deg = [result.path.az_deg(pathIndex), ...
-            result.path.el_deg(pathIndex)];
-        currentTime_s = result.path.time_s(pathIndex);
+        dataIndex = pathDataIndex(path,pathIndex);
+        currentAzEl_deg = [path.az_deg(pathIndex),path.el_deg(pathIndex)];
+        currentTime_s = path.time_s(pathIndex);
     else
         dataIndex = suppliedDataIndex;
         currentAzEl_deg = scenario.startAzEl_deg;
@@ -175,17 +195,17 @@ function drawScenarioFrame(figureHandle,entry,index,total,pathIndex, ...
     end
 
     drawStaticPolygons(ax,scenario.options.staticPolygons,palette);
-    drawDynamicFramePolygons(ax,scenario.data,dataIndex,palette);
+    drawDynamicFramePolygons(ax,scenario.data,currentTime_s, ...
+        scenario.options,palette);
 
-    if ~isempty(result.path.time_s)
-        plot(ax,result.path.az_deg,result.path.el_deg,':', ...
+    if ~isempty(path.time_s)
+        plot(ax,path.az_deg,path.el_deg,':', ...
             'Color',palette.plan,'LineWidth',1.5);
-        plot(ax,result.path.az_deg(1:pathIndex), ...
-            result.path.el_deg(1:pathIndex),'-', ...
+        plot(ax,path.az_deg(1:pathIndex),path.el_deg(1:pathIndex),'-', ...
             'Color',palette.executed,'LineWidth',2.6);
     end
 
-    goalAzEl_deg = goalAtDataIndex(scenario,dataIndex);
+    goalAzEl_deg = goalAtTime(scenario,currentTime_s);
     scatter(ax,scenario.startAzEl_deg(1),scenario.startAzEl_deg(2), ...
         68,palette.start,'filled','MarkerEdgeColor','w','LineWidth',1);
     scatter(ax,goalAzEl_deg(1),goalAzEl_deg(2),80,palette.goal, ...
@@ -205,10 +225,10 @@ function drawScenarioFrame(figureHandle,entry,index,total,pathIndex, ...
     ylabel(ax,'Elevation (deg)');
 
     if ~entry.expectedSuccess
-        if isempty(result.path.time_s)
+        if isempty(path.time_s)
             progress = dataIndex/numel(scenario.data.time_s);
         else
-            progress = pathIndex/numel(result.path.time_s);
+            progress = pathIndex/numel(path.time_s);
         end
         state = 'SEARCHING';
         if isFinal
@@ -217,7 +237,7 @@ function drawScenarioFrame(figureHandle,entry,index,total,pathIndex, ...
         arrivalText = 'Expected result: unreachable';
         sourceText = sprintf('Source %s',formatSource( ...
             result.diagnostic.selectedPolicySource));
-    elseif isempty(result.path.time_s)
+    elseif isempty(path.time_s)
         progress = dataIndex/numel(scenario.data.time_s);
         state = 'SEARCHING';
         if isFinal
@@ -226,8 +246,8 @@ function drawScenarioFrame(figureHandle,entry,index,total,pathIndex, ...
         arrivalText = 'Expected result: unreachable';
         sourceText = 'Exhaustive search completed';
     else
-        progress = pathIndex/numel(result.path.time_s);
-        if result.path.isWaiting(pathIndex)
+        progress = pathIndex/numel(path.time_s);
+        if path.isWaiting(pathIndex)
             state = 'WAITING';
         else
             state = 'SLEWING';
@@ -240,10 +260,17 @@ function drawScenarioFrame(figureHandle,entry,index,total,pathIndex, ...
         sourceText = sprintf('Source %s',formatSource( ...
             result.diagnostic.selectedPolicySource));
     end
+    if entry.expectedSuccess
+        commandText = 'C2 command: verified';
+        sidebarLabel = 'TIME-ALIGNED C2 MOTION';
+    else
+        commandText = 'No command: unreachable verified';
+        sidebarLabel = 'EXHAUSTIVE NO-ROUTE CHECK';
+    end
     metrics = {sprintf('Time %.1f s',currentTime_s), ...
         sprintf('State %s',state),arrivalText,sourceText, ...
-        auditSummary(entry),'Future route: dotted gray'};
-    addSidebar(figureHandle,'TIME-ALIGNED GEOMETRY',metrics, ...
+        auditSummary(entry),commandText};
+    addSidebar(figureHandle,sidebarLabel,metrics, ...
         progress,isFinal && entry.passed,palette,~entry.expectedSuccess);
 end
 
@@ -251,26 +278,25 @@ end
 function drawSpiralFrame(figureHandle,report,pathIndex,isFinal)
     scenario = report.spiralScenario;
     result = report.spiralResult;
+    path = selectAzElDisplayPath(result);
     [ax,palette] = makePlotCanvas(figureHandle, ...
         'Spiral-to-center navigation','SPIRAL: 5.25 TURNS');
 
     wall = scenario.spiralWallAzEl_deg;
     patch(ax,wall(:,1),wall(:,2),palette.wall, ...
         'FaceAlpha',0.88,'EdgeColor',palette.wallEdge,'LineWidth',1.0);
-    plot(ax,result.path.az_deg,result.path.el_deg,':', ...
+    plot(ax,path.az_deg,path.el_deg,':', ...
         'Color',palette.plan,'LineWidth',1.4);
-    plot(ax,result.path.az_deg(1:pathIndex), ...
-        result.path.el_deg(1:pathIndex),'-', ...
+    plot(ax,path.az_deg(1:pathIndex),path.el_deg(1:pathIndex),'-', ...
         'Color',palette.executed,'LineWidth',2.2);
-    scatter(ax,result.path.az_deg(1),result.path.el_deg(1),68, ...
+    scatter(ax,path.az_deg(1),path.el_deg(1),68, ...
         palette.start,'filled','MarkerEdgeColor','w','LineWidth',1);
     scatter(ax,scenario.centerAzEl_deg(1),scenario.centerAzEl_deg(2), ...
         80,palette.goal,'filled','MarkerEdgeColor','w','LineWidth',1);
-    currentAzEl_deg = [result.path.az_deg(pathIndex), ...
-        result.path.el_deg(pathIndex)];
+    currentAzEl_deg = [path.az_deg(pathIndex),path.el_deg(pathIndex)];
     drawCurrentPosition(ax,currentAzEl_deg, ...
         scenario.options.clearance_deg,palette);
-    text(ax,result.path.az_deg(1)-0.8,result.path.el_deg(1)+1.2, ...
+    text(ax,path.az_deg(1)-0.8,path.el_deg(1)+1.2, ...
         'START','HorizontalAlignment','right','Color',palette.text, ...
         'FontSize',8,'FontWeight','bold');
     text(ax,scenario.centerAzEl_deg(1),scenario.centerAzEl_deg(2)-1.5, ...
@@ -282,15 +308,15 @@ function drawSpiralFrame(figureHandle,report,pathIndex,isFinal)
     xlabel(ax,'Azimuth (deg)');
     ylabel(ax,'Elevation (deg)');
 
-    winding_deg = netPathWinding(result.path,pathIndex, ...
+    winding_deg = netPathWinding(path,pathIndex, ...
         scenario.centerAzEl_deg,max(scenario.options.gridStep_deg));
-    progress = pathIndex/numel(result.path.time_s);
+    progress = pathIndex/numel(path.time_s);
     state = 'WINDING';
     if isFinal
         state = 'CENTER REACHED';
     end
     metrics = {sprintf('Time %.1f / %.1f s', ...
-        result.path.time_s(pathIndex),result.path.time_s(end)), ...
+        path.time_s(pathIndex),path.time_s(end)), ...
         sprintf('State %s',state), ...
         sprintf('Net winding %.1f deg',winding_deg), ...
         sprintf('Required >= %.0f deg',scenario.minimumWinding_deg), ...
@@ -298,7 +324,7 @@ function drawSpiralFrame(figureHandle,report,pathIndex,isFinal)
         getAuditClearance(report.spiralAudit)), ...
         sprintf('Source %s',formatSource( ...
         result.diagnostic.selectedPolicySource))};
-    addSidebar(figureHandle,'CLEARANCE-AUDITED PATH',metrics, ...
+    addSidebar(figureHandle,'CLEARANCE-AUDITED C2 PATH',metrics, ...
         progress,isFinal,palette,false);
 end
 
@@ -443,12 +469,11 @@ function drawStaticPolygons(ax,polygons,palette)
 end
 
 
-function drawDynamicFramePolygons(ax,data,dataIndex,palette)
-    if isempty(data.az_deg{dataIndex})
+function drawDynamicFramePolygons(ax,data,time_s,options,palette)
+    [az_deg,el_deg] = interpolateAzElObstacleFrame(data,time_s,options);
+    if isempty(az_deg)
         return
     end
-    az_deg = data.az_deg{dataIndex};
-    el_deg = data.el_deg{dataIndex};
     separators = isnan(az_deg) | isnan(el_deg);
     changes = diff([true;separators(:);true]);
     starts = find(changes == -1);
@@ -474,12 +499,33 @@ function drawCurrentPosition(ax,azEl_deg,clearance_deg,palette)
 end
 
 
-function goalAzEl_deg = goalAtDataIndex(scenario,dataIndex)
+function goalAzEl_deg = goalAtTime(scenario,time_s)
     if size(scenario.goalAzEl_deg,1) == 1
         goalAzEl_deg = scenario.goalAzEl_deg;
-    else
-        goalIndex = min(max(1,dataIndex),size(scenario.goalAzEl_deg,1));
-        goalAzEl_deg = scenario.goalAzEl_deg(goalIndex,:);
+        return
+    end
+    dataTime_s = scenario.data.time_s(:);
+    if time_s <= dataTime_s(1)
+        goalAzEl_deg = scenario.goalAzEl_deg(1,:);
+        return
+    elseif time_s >= dataTime_s(end)
+        goalAzEl_deg = scenario.goalAzEl_deg(end,:);
+        return
+    end
+    firstIndex = find(dataTime_s <= time_s,1,'last');
+    secondIndex = firstIndex+1;
+    fraction = (time_s-dataTime_s(firstIndex))/ ...
+        (dataTime_s(secondIndex)-dataTime_s(firstIndex));
+    firstGoal = scenario.goalAzEl_deg(firstIndex,:);
+    secondGoal = scenario.goalAzEl_deg(secondIndex,:);
+    goalAzEl_deg = firstGoal+fraction.*[ ...
+        shortestAzimuthDeltaDeg(firstGoal(1),secondGoal(1)), ...
+        secondGoal(2)-firstGoal(2)];
+    if isfield(scenario.options,'azimuthTopology') && ...
+            strcmpi(string(scenario.options.azimuthTopology),"periodic")
+        azimuthMinimum_deg = scenario.options.azLim_deg(1);
+        goalAzEl_deg(1) = mod(goalAzEl_deg(1)-azimuthMinimum_deg,360)+ ...
+            azimuthMinimum_deg;
     end
 end
 
@@ -516,7 +562,9 @@ end
 
 
 function clearance_deg = getAuditClearance(audit)
-    if isfield(audit,'minimumClearance_deg')
+    if isfield(audit,'certifiedMinimumClearance_deg')
+        clearance_deg = audit.certifiedMinimumClearance_deg;
+    elseif isfield(audit,'minimumClearance_deg')
         clearance_deg = audit.minimumClearance_deg;
     elseif isfield(audit,'minClearance_deg')
         clearance_deg = audit.minClearance_deg;

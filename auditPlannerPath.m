@@ -2,7 +2,9 @@ function audit = auditPlannerPath(scenario,result)
 %AUDITPLANNERPATH Independently verify continuous path clearance.
 %   AUDIT = AUDITPLANNERPATH(SCENARIO,RESULT) checks every reported path
 %   segment against the original static polygons and conservative swept
-%   dynamic polygons. Dynamic vertices are assumed to move linearly between
+%   dynamic polygons. When RESULT contains an analytic smooth trajectory,
+%   the audit dispatches to AUDITAZELTRAJECTORY and certifies the quintic
+%   curve itself. Dynamic vertices are assumed to move linearly between
 %   adjacent data frames. A successful result is also checked while holding
 %   its final position for OPTIONS.goalHold_s.
 
@@ -22,6 +24,17 @@ function audit = auditPlannerPath(scenario,result)
     if ~isfield(scenario,'data') || ~isfield(scenario,'options')
         audit = failAudit(audit,"scenario is missing data or options", ...
             NaN,[NaN,NaN],"input");
+        return
+    end
+    if isfield(result,'path') && isstruct(result.path) && ...
+            isfield(result.path,'segments') && ~isempty(result.path.segments)
+        audit = auditAzElTrajectory(scenario,result.path,true);
+        return
+    end
+    if isfield(result,'trajectory') && isstruct(result.trajectory) && ...
+            isfield(result.trajectory,'segments') && ...
+            ~isempty(result.trajectory.segments)
+        audit = auditAzElTrajectory(scenario,result.trajectory,true);
         return
     end
     if ~isfield(result,'path') || isempty(result.path) || ...

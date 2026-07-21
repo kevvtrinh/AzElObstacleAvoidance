@@ -4,7 +4,9 @@ This package implements time-dependent tabular Q-learning for moving keep-out
 polygons in azimuth/elevation space. It supports waiting, moving goals, static
 and dynamic obstacles, clearance inflation, cable-angle branches, periodic
 azimuth topology, collision-checked smoothing, deterministic graph-search
-fallback, diagnostics, plots, animations, and a deterministic planner gauntlet.
+fallback, C2-continuous quintic command trajectories, explicit rate,
+acceleration, and jerk limits, diagnostics, plots, animations, and a
+deterministic planner gauntlet.
 
 ![Complete planner gauntlet](gauntlet_complete_suite.gif)
 
@@ -61,8 +63,8 @@ the legacy two-run moving-mask/spiral renderer.
 
 `createPlannerGauntletSuite` builds the same fixed-seed scenarios on every run.
 `runPlannerGauntletSuite` checks expected success or failure, an independent
-continuous collision audit, slew limits, and the scenario-specific behavior
-below.
+continuous audit of the analytic command curve, rate/acceleration/jerk limits,
+C2 continuity, and the scenario-specific behavior below.
 
 | Scenario | Setup | Scenario-specific check |
 | --- | --- | --- |
@@ -142,11 +144,30 @@ edges are included, then buffered by cell and clearance margins before an
 action is accepted. For the strongest swept-motion guarantee, keep each moving
 contour's vertex count and ordering consistent from one frame to the next.
 
-The path smoother and final collision diagnostic use the same segment-level
-safety model. A visually intersecting shortcut cannot pass merely because its
-sampled endpoints occupy free grid cells. Regression tests cover both a moving
-obstacle that crosses between frames and a thin static obstacle located between
-grid points.
+The waypoint shortcut pass uses the same segment-level safety model. It is then
+converted into fixed-schedule quintic Bezier fillets. Each fillet matches
+position, velocity, and acceleration at its joins; no global retiming is used,
+so a gate crossing is not silently moved into a different obstacle interval.
+The analytic curve is recursively certified against interpolated moving
+polygons, rather than treating dense plotted samples as proof of safety.
+The same audit honors `temporalPadding_s`, so smoothing cannot enter an
+adjacent-time obstacle reservation that the discrete planner avoided.
+
+Rate, acceleration, and jerk are certified from the Bezier derivative control
+points. If no curve can satisfy collision and actuator limits at the existing
+schedule, the planner tries the remaining ranked routes and graph-search
+fallback. If none produces a certified command, `result.success` and
+`result.trajectory.success` are false while `result.routeSuccess` records
+whether a raw diagnostic route reached the goal.
+When `goalHold_s` is positive, the trajectory must also reach zero velocity
+and acceleration before that stationary hold begins. Set
+`trajectoryRequireEndpointRest=true` when a command must start and end at rest;
+this enforces zero velocity and acceleration at both endpoints. It defaults to
+`false` because fixed obstacle timing can make a rest-to-rest ramp infeasible
+when the first or final raw leg already uses all available slew rate.
+Regression tests cover moving obstacles that cross between frames, thin static
+obstacles between grid points, coarse 90-degree corners, and dynamic slalom
+corners.
 
 ## Use existing `azElData`
 
@@ -178,6 +199,14 @@ options.maxQTableMB = 512;
 options.turnPenalty = 0.75;
 options.smoothPath = true;
 options.smoothingMaxLookahead = 250;
+
+options.generateSmoothTrajectory = true;
+options.trajectoryRequireEndpointRest = false; % Set true for rest-to-rest commands
+options.trajectorySampleTime_s = 0.1;
+options.maxAzAcceleration_deg_s2 = 40;
+options.maxElAcceleration_deg_s2 = 40;
+options.maxAzJerk_deg_s3 = 200;
+options.maxElJerk_deg_s3 = 200;
 options.verbose = true;
 
 result = planAzElQLearning( ...
@@ -186,6 +215,27 @@ result = planAzElQLearning( ...
 plotAzElQLearningResult(azElData,result);
 animateAzElQLearningPlan(azElData,result);
 ```
+
+`result.path` retains the time-aligned planner polyline for reproducibility and
+scenario metrics. `result.trajectory` is the executable dense command history:
+
+```matlab
+commandTime_s = result.trajectory.time_s;
+commandAz_deg = result.trajectory.az_deg;
+commandEl_deg = result.trajectory.el_deg;
+
+assert(result.success);
+assert(result.trajectory.success);
+assert(result.diagnostic.trajectoryCollisionFree);
+assert(result.diagnostic.trajectoryKinematicallyFeasible);
+```
+
+The trajectory also contains axis rate, acceleration, and jerk histories plus
+the exact piecewise-quintic Bezier segments used by the independent auditor.
+If acceleration or jerk limits are omitted, their defaults are respectively
+four and twenty times the corresponding axis slew-rate limit. The plotting,
+animation, and gauntlet GIF functions automatically prefer this smooth command
+trajectory.
 
 The expected data fields are:
 
@@ -201,6 +251,11 @@ NaNs may separate multiple contours in one frame. The occupancy builder fills
 the supplied polygons with `inpolygon`; it does not replace them with bounding
 boxes. Polygons that cross the `-180/180` seam are unwrapped and rasterized on
 the appropriate seam branches.
+
+For time-accurate animation, corresponding obstacle vertices are interpolated
+between data frames. Keep contour ordering and vertex ordering stable whenever
+an obstacle persists. If that topology changes, the renderer shows both
+endpoint geometries rather than visually inventing a correspondence.
 
 An `N`-by-2 goal history aligned with `azElData.time_s` is supported for moving
 goal interception.
@@ -236,7 +291,9 @@ options.goalAzimuthIsWrapped = true;
 Periodic mode makes the first and last azimuth cells neighbors and omits the
 duplicated upper seam endpoint. `result.path.az_deg` is a continuous unwrapped
 mechanical history; `result.path.azWrapped_deg` contains the equivalent values
-inside the configured 360-degree plotting interval.
+inside the configured 360-degree plotting interval. The same distinction is
+available in `result.trajectory.az_deg` and
+`result.trajectory.azWrapped_deg`.
 
 The helpers below use shortest-arc degree semantics:
 
@@ -322,20 +379,28 @@ Otherwise only the wait action may remain valid.
   scenarios
 - `runPlannerGauntletSuite.m` - scenario execution and behavior assertions
 - `auditPlannerPath.m` - independent static, swept-dynamic, and goal-hold path
-  audit
+  audit and trajectory dispatch
+- `smoothAzElTrajectory.m` - adaptive fixed-time C2 quintic trajectory
+  generation with rate, acceleration, and jerk limits
+- `auditAzElTrajectory.m` - analytic curve, moving-obstacle, continuity, and
+  actuator-limit certification
+- `interpolateAzElObstacleFrame.m` - time-accurate obstacle geometry for
+  animation and GIF frames
 - `createSpiralGauntletScenario.m` - 5.25-cycle spiral-to-center challenge
 - `runAzimuthWraparoundGauntlet.m` - seven named seam and wrapped-angle checks
 - `runGauntlet.m` - complete static-analysis, unit-test, scenario, seam,
   dynamic-mask, and spiral entry point
 - `createGauntletSuiteGif.m` - complete-suite fixed-canvas GIF renderer
 - `createGauntletGif.m` - legacy two-run GIF renderer
-- `testQLearningAzElPlanner.m` - core, safety, and seven wraparound regressions
+- `testQLearningAzElPlanner.m` - core, continuous-trajectory, safety, and seven
+  wraparound regressions
 - `plotAzElQLearningResult.m` - complete mask sweep and final path
 - `animateAzElQLearningPlan.m` - current mask, executed path, and optional GIF
 - `createQLearningExampleAzElData.m` - self-contained moving-mask example
 - `runQLearningAzElExample.m` - runnable demonstration
 
-The planner enforces position and per-sample slew limits. Gimbal acceleration
-and jerk are not part of the Q state; apply a downstream motion-profile checker
-when those actuator limits must be guaranteed beyond the wraparound regression
-cases.
+Acceleration and jerk are intentionally not added to the tabular Q state,
+which would multiply the state space. Instead, the selected time-aligned route
+is converted into an analytic C2 command trajectory and independently
+certified. This keeps the learner compact while still making actuator limits a
+required property of the command output.
